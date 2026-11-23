@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#ffe9b8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Watermelon Go">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Watermelon Go</title>
+<style>
+  html,body{margin:0;height:100%;background:#ffe9b8;overflow:hidden;overscroll-behavior:none;
+    touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;touch-action:none}
+  #over{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    flex-direction:column;gap:14px;background:rgba(0,0,0,.55);color:#fff;text-align:center}
+  #over h1{margin:0;font-size:38px}
+  #over p{margin:0;font-size:22px}
+  #over button{font-size:22px;font-weight:700;padding:12px 36px;border:0;border-radius:14px;
+    background:#4cc46f;color:#fff}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="over">
+  <h1>Game Over</h1>
+  <p id="final"></p>
+  <button id="again">เล่นใหม่</button>
+</div>
+<script src="settings.js"></script>
+<script>
+"use strict";
+WG.init({ frameSelector: null });   // ปุ่มตั้งค่า + ระบบอัปโหลดรูป
+// ---------- config ----------
+const W = 360, H = 640, L = 20, R = 340, FLOOR = 610, WALL_TOP = 100, LINE = 150, SPAWN_Y = 90;
+const G = 1800, SUB = 4;
+const F = [
+  { e: "🍒", r: 14, c: "#e0283c" }, { e: "🍓", r: 20, c: "#f0465a" },
+  { e: "🍇", r: 26, c: "#9156c8" }, { e: "🍊", r: 33, c: "#f9a02b" },
+  { e: "🍎", r: 40, c: "#d73232" }, { e: "🍐", r: 49, c: "#a9d246" },
+  { e: "🍑", r: 58, c: "#ffaa96" }, { e: "🍍", r: 68, c: "#f0d23c" },
+  { e: "🍈", r: 80, c: "#96d782" }, { e: "🍉", r: 94, c: "#3ca050" },
+];
+const PTS = [1, 3, 6, 10, 15, 21, 28, 36, 45, 55];
+
+// ---------- canvas ----------
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * s + "px"; cv.style.height = H * s + "px";
+  cv.width = Math.round(W * s * dpr); cv.height = Math.round(H * s * dpr);
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+// ---------- state ----------
+let balls, score, best, cur, next, aimX, cooldown, over, overT, dragging = false;
+try { best = +localStorage.getItem("wg_best") || 0; } catch (e) { best = 0; }
+const rnd = () => Math.floor(Math.random() * 4);
+
+function reset() {
+  balls = []; score = 0; aimX = W / 2; cooldown = 0; over = false; overT = 0;
+  cur = rnd(); next = rnd();
+  document.getElementById("over").style.display = "none";
+}
+reset();
+
+// ---------- audio ----------
+let actx = null;
+function beep(level) {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = 300 + level * 70; o.type = "sine";
+    g.gain.setValueAtTime(0.15, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.18);
+    o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime + 0.2);
+  } catch (e) {}
+}
+
+// ---------- input ----------
+const clampX = x => Math.max(L + F[cur].r, Math.min(R - F[cur].r, x));
+function px(e) { const r = cv.getBoundingClientRect(); return (e.clientX - r.left) / r.width * W; }
+cv.addEventListener("pointerdown", e => {
+  if (over) return;
+  dragging = true; cv.setPointerCapture(e.pointerId); aimX = clampX(px(e));
+  if (!actx) beep(0);
+});
+cv.addEventListener("pointermove", e => { if (!over) aimX = clampX(px(e)); });
+cv.addEventListener("pointerup", e => {
+  if (!dragging) return;
+  dragging = false; aimX = clampX(px(e)); drop();
+});
+document.addEventListener("contextmenu", e => e.preventDefault());
+
+function drop() {
+  if (over || cooldown > 0) return;
+  const f = F[cur];
+  balls.push({ x: aimX, y: SPAWN_Y, vx: 0, vy: 0, r: f.r, l: cur, t: 0, pop: 0, dead: false });
+  cur = next; next = rnd(); cooldown = 0.6; aimX = clampX(aimX);
+}
+
+// ---------- physics ----------
+function collide(pending) {
+  for (let i = 0; i < balls.length; i++) {
+    const a = balls[i]; if (a.dead) continue;
+    for (let j = i + 1; j < balls.length; j++) {
+      const b = balls[j]; if (b.dead || a.dead) continue;
+      const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r;
+      if (dx * dx + dy * dy >= rr * rr) continue;
+      if (a.l === b.l) {            // merge!
+        a.dead = b.dead = true;
+        pending.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2,
+          vx: (a.vx + b.vx) / 2, vy: (a.vy + b.vy) / 2, l: a.l });
+        continue;
+      }
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.001;
+      const nx = dx / d, ny = dy / d, ov = rr - d;
+      const ma = a.r * a.r, mb = b.r * b.r, tm = ma + mb;
+      a.x -= nx * ov * mb / tm; a.y -= ny * ov * mb / tm;
+      b.x += nx * ov * ma / tm; b.y += ny * ov * ma / tm;
+      const vn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      if (vn < 0) {
+        const jn = -1.1 * vn / (1 / ma + 1 / mb);
+        a.vx -= jn * nx / ma; a.vy -= jn * ny / ma;
+        b.vx += jn * nx / mb; b.vy += jn * ny / mb;
+      }
+    }
+  }
+}
+
+// มุมล่างของกรอบมน: ดันลูกไม่ให้ทะลุขอบโค้ง
+function cornerFix(b) {
+  const cr = Math.min(WG.settings.frameRadius, (R - L) / 2);
+  if (b.r >= cr || b.y <= FLOOR - cr) return;
+  const cy = FLOOR - cr;
+  const cx = b.x < L + cr ? L + cr : (b.x > R - cr ? R - cr : null);
+  if (cx === null) return;
+  const dx = b.x - cx, dy = b.y - cy, d = Math.hypot(dx, dy), lim = cr - b.r;
+  if (d <= lim || d === 0) return;
+  const nx = dx / d, ny = dy / d;
+  b.x = cx + nx * lim; b.y = cy + ny * lim;
+  const vn = b.vx * nx + b.vy * ny;
+  if (vn > 0) { b.vx -= 1.1 * vn * nx; b.vy -= 1.1 * vn * ny; }
+}
+
+function update(dt) {
+  if (over || WG.paused) return;
+  dt = Math.min(dt, 1 / 30);
+  if (cooldown > 0) cooldown -= dt;
+  const h = dt / SUB;
+  for (let s = 0; s < SUB; s++) {
+    for (const b of balls) {
+      b.vy = Math.min(b.vy + G * h, 1600);
+      b.x += b.vx * h; b.y += b.vy * h; b.vx *= 0.9995;
+      if (b.x - b.r < L) { b.x = L + b.r; b.vx = Math.abs(b.vx) * 0.1; }
+      if (b.x + b.r > R) { b.x = R - b.r; b.vx = -Math.abs(b.vx) * 0.1; }
+      if (b.y + b.r > FLOOR) { b.y = FLOOR - b.r; b.vy = -Math.abs(b.vy) * 0.1; b.vx *= 0.97; }
+      cornerFix(b);
+    }
+    const pending = [];
+    collide(pending); collide(pending);
+    if (pending.length) {
+      balls = balls.filter(b => !b.dead);
+      for (const p of pending) {
+        score += PTS[p.l];
+        beep(p.l);
+        if (p.l < F.length - 1) {
+          const f = F[p.l + 1];
+          balls.push({ x: p.x, y: p.y, vx: p.vx, vy: p.vy, r: f.r, l: p.l + 1, t: 1.5, pop: 1, dead: false });
+        } else { score += 100; }     // 🍉 + 🍉 = bonus
+      }
+      if (score > best) { best = score; try { localStorage.setItem("wg_best", best); } catch (e) {} }
+    }
+  }
+  let danger = false;
+  for (const b of balls) {
+    b.t += dt; b.pop = Math.max(0, b.pop - dt * 4);
+    if (b.t > 1.5 && b.y - b.r < LINE) danger = true;
+  }
+  overT = danger ? overT + dt : 0;
+  if (overT > 2.5) {
+    over = true;
+    document.getElementById("final").textContent = "คะแนน " + score + "  |  สูงสุด " + best;
+    document.getElementById("over").style.display = "flex";
+  }
+}
+
+// ---------- drawing ----------
+function drawBall(x, y, l, scale, alpha, rMax) {
+  const f = F[l];
+  const r = (rMax ? Math.min(f.r, rMax) : f.r) * scale;
+  ctx.globalAlpha = alpha;
+  const img = WG.fruits[l];            // รูปที่อัปโหลด (ถ้ามี) ไม่งั้นใช้อีโมจิเดิม
+  if (img) {
+    ctx.drawImage(img, x - r, y - r, r * 2, r * 2);
+  } else {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = f.c; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.stroke();
+    ctx.font = Math.round(r * 1.35) + "px 'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(f.e, x, y + r * 0.06);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  const bi = WG.bgImage;
+  if (bi) {                              // พื้นหลังที่อัปโหลด (cover)
+    const k = Math.max(W / bi.width, H / bi.height), bw = bi.width * k, bh = bi.height * k;
+    ctx.drawImage(bi, (W - bw) / 2, (H - bh) / 2, bw, bh);
+  } else {
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#fff3d0"); bg.addColorStop(1, "#ffd9a0");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  }
+
+  // กรอบเกม (มุมล่างมนตามที่ตั้งค่า)
+  const cr = Math.min(WG.settings.frameRadius, (R - L) / 2);
+  ctx.beginPath();
+  ctx.moveTo(L, WALL_TOP); ctx.lineTo(L, FLOOR - cr);
+  if (cr > 0) ctx.arcTo(L, FLOOR, L + cr, FLOOR, cr); else ctx.lineTo(L, FLOOR);
+  ctx.lineTo(R - cr, FLOOR);
+  if (cr > 0) ctx.arcTo(R, FLOOR, R, FLOOR - cr, cr); else ctx.lineTo(R, FLOOR);
+  ctx.lineTo(R, WALL_TOP);
+  ctx.fillStyle = "rgba(255,255,255,.55)"; ctx.fill();
+  ctx.strokeStyle = "#8a5a3c"; ctx.lineWidth = 6; ctx.lineJoin = "round"; ctx.stroke();
+
+  ctx.setLineDash([8, 6]); ctx.lineWidth = 2;
+  ctx.strokeStyle = overT > 0 && Math.floor(performance.now() / 150) % 2 ? "#ff0000" : "rgba(255,60,60,.6)";
+  ctx.beginPath(); ctx.moveTo(L, LINE); ctx.lineTo(R, LINE); ctx.stroke(); ctx.setLineDash([]);
+
+  for (const b of balls) drawBall(b.x, b.y, b.l, 1 + b.pop * 0.25, 1);
+
+  if (!over && cooldown <= 0) {
+    ctx.setLineDash([4, 6]); ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(aimX, SPAWN_Y); ctx.lineTo(aimX, FLOOR); ctx.stroke(); ctx.setLineDash([]);
+    drawBall(aimX, SPAWN_Y, cur, 1, 1);
+  }
+
+  ctx.fillStyle = "#5a3a22"; ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left"; ctx.font = "bold 30px system-ui,sans-serif";
+  ctx.fillText(score, 22, 48);
+  ctx.font = "14px system-ui,sans-serif"; ctx.fillText("สูงสุด " + best, 22, 70);
+  ctx.textAlign = "right"; ctx.font = "14px system-ui,sans-serif"; ctx.fillText("ถัดไป", 338, 30);
+  drawBall(310, 56, next, 1, 1, 20);
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  update((now - last) / 1000); last = now;
+  draw(); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+document.getElementById("again").addEventListener("click", reset);
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
